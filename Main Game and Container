@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dungeon Crawler</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #1a1a1a;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 1rem;
+        }
+        #game-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            background-color: #2c2c2c;
+            border: 4px solid #5a5a5a;
+            border-radius: 12px;
+            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.5);
+            padding: 16px;
+        }
+        canvas {
+            background-color: #111111;
+            display: block;
+            border-radius: 8px;
+        }
+        .stats-box {
+            background-color: #1f1f1f;
+            color: #ddd;
+            padding: 8px 16px;
+            border-radius: 8px;
+            margin-bottom: 12px;
+            font-size: 0.9rem;
+            width: 100%;
+            display: flex;
+            justify-content: space-between;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="game-container">
+        <div class="stats-box">
+            <span>Enemies Remaining: <span id="enemy-count">0</span> / 10</span>
+            <span>Controls: WASD (Move) | Left Click (Attack)</span>
+        </div>
+        <canvas id="gameCanvas"></canvas>
+        <!-- NEW: Respawn Button, hidden by default -->
+        <button id="respawnButton" onclick="respawnGame()" 
+            class="hidden mt-4 px-6 py-2 bg-blue-600 text-white font-bold rounded-lg shadow-lg 
+                   hover:bg-blue-700 transition duration-150 transform hover:scale-105"
+        >
+            Respawn Dungeon
+        </button>
+    </div>
+
+    <script>
+        // --- Game Setup ---
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        // Grid and Canvas Configuration
+        const GRID_SIZE = 30; // Grid cells (30x30)
+        const CELL_SIZE = 20; // Pixels per cell
+        canvas.width = GRID_SIZE * CELL_SIZE;
+        canvas.height = GRID_SIZE * CELL_SIZE;
+
+        // Colors
+        const COLOR_WALL = '#333333';
+        const COLOR_FLOOR = '#111111';
+        const COLOR_PLAYER = '#00aaff';
+        const COLOR_ENEMY = '#ff4444';
+        const COLOR_SWORD = '#ffffff';
+        // COLOR_PATH removed as it's no longer used for drawing
+
+        // Game State
+        let player = {
+            x: CELL_SIZE * 1.5,
+            y: CELL_SIZE * 1.5,
+            radius: 8,
+            speed: 3,
+            vx: 0,
+            vy: 0,
+            health: 10, 
+            maxHealth: 10, 
+            isAttacking: false,
+            attackStartTime: 0,
+            attackDuration: 200, // ms
+            damageCooldown: 200, // 0.2s attack cooldown
+            lastDamageTime: 0,
+        };
+
+        let enemies = [];
+        let keys = {};
+        let mousePos = { x: 0, y: 0 };
+        let gameOver = false;
+        let lastTimestamp = 0;
+        let pathfindingInterval = 150; // Reduced for smoother AI
+        let lastPathfindTime = 0;
+
+        // Spawning State
+        const MAX_ENEMIES = 10; // Cap at 10 enemies
+        const SPAWN_INTERVAL = 3000; // 3 seconds between spawns
+        let lastSpawnTime = 0;
+
+        // Get the respawn button element
+        const respawnButton = document.getElementById('respawnButton');
+
+
+        // --- Dungeon Map: 0 = Floor, 1 = Wall ---
+        // A simple, blocky dungeon layout
+        const dungeonMap = new Array(GRID_SIZE).fill(0).map(() => new Array(GRID_SIZE).fill(0));
+
+        // Create some obstacle walls (1s)
+        function generateMap() {
+            // Border
+            for (let i = 0; i < GRID_SIZE; i++) {
+                dungeonMap[i][0] = 1;
+                dungeonMap[i][GRID_SIZE - 1] = 1;
+                dungeonMap[0][i] = 1;
+                dungeonMap[GRID_SIZE - 1][i] = 1;
+            }
+
+            // Internal walls
+            for (let i = 5; i < 25; i++) {
+                dungeonMap[i][5] = 1;
+                dungeonMap[i][25] = 1;
+            }
+            for (let i = 5; i < 15; i++) {
+                dungeonMap[15][i] = 1;
+            }
+            for (let i = 18; i < 25; i++) {
+                dungeonMap[22][i] = 1;
+            }
+            for (let i = 8; i < 20; i++) {
+                dungeonMap[8][i] = 1;
+            }
+
+            // Create some deliberate openings (pathways)
+            dungeonMap[5][5] = 0;
+            dungeonMap[24][5] = 0;
+            dungeonMap[15][10] = 0;
+            dungeonMap[15][11] = 0;
+            dungeonMap[25][15] = 0;
+            dungeonMap[25][16] = 0;
+        }
+
+        generateMap();
+
+        // --- Helper Functions ---
+
+        /** Converts world coordinates to grid coordinates */
+        function toGrid(coord) {
+            return Math.floor(coord / CELL_SIZE);
+        }
+
+        /** Converts grid coordinates to world center coordinates */
+        function toWorld(coord) {
+            return coord * CELL_SIZE + CELL_SIZE / 2;
+        }
+
+        /** Calculates Euclidean distance squared */
+        function distSq(p1, p2) {
+            return (p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2;
+        }
+
+        /** Checks if a grid cell is a wall, considering the buffer zone */
+        function isWall(gx, gy) {
+            if (gx < 0 || gx >= GRID_SIZE || gy < 0 || gy >= GRID_SIZE) {
+                return true; // Out of bounds is a wall
+            }
+            return dungeonMap[gy][gx] === 1;
+        }
+
+        /**
+         * The buffer zone logic is implemented here: a cell is unwalkable if it is a wall (1)
+         * or if any of its immediate 8 neighbors are walls.
+         */
+        function isWalkableWithBuffer(gx, gy) {
+            for (let dx = -1; dx <= 1; dx++) {
+                for (let dy = -1; dy <= 1; dy++) {
+                    if (isWall(gx + dx, gy + dy)) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+
+        // --- A* Pathfinding Algorithm (Core AI Logic) ---
+
+        // Node structure for A*
+        class Node {
+            constructor(x, y, g, h, parent) {
+                this.x = x; // grid x
+                this.y = y; // grid y
+                this.g = g; // cost from start
+                this.h = h; h // heuristic (estimated cost to end)
+                this.f = g + h; // total cost
+                this.parent = parent;
+            }
+        }
+
+        /** Calculates Manhattan distance for heuristic (h-score) */
+        function manhattanDistance(node, end) {
+            return Math.abs(node.x - end.x) * 10 + Math.abs(node.y - end.y) * 10;
+        }
+
+        /** Reconstructs the path from the end node back to the start */
+        function reconstructPath(node) {
+            const path = [];
+            let current = node;
+            while (current) {
+                // Convert grid coordinates back to world center coordinates
+                path.unshift({ x: toWorld(current.x), y: toWorld(current.y) });
+                current = current.parent;
+            }
+            // Remove the start node from the path, as the entity is already there
+            path.shift();
+            return path;
+        }
+
+        /** Finds the shortest path between two points on the grid using A* */
+        function findPath(start, end) {
+            const startGrid = { x: toGrid(start.x), y: toGrid(start.y) };
+            const endGrid = { x: toGrid(end.x), y: toGrid(end.y) };
+
+            if (!isWalkableWithBuffer(endGrid.x, endGrid.y)) {
+                return null; // Target is in an unwalkable (or buffered) spot
+            }
+
+            // Check if start is already at the end
+            if (startGrid.x === endGrid.x && startGrid.y === endGrid.y) {
+                return [];
+            }
+
+            const openList = [];
+            const closedList = new Set();
+            const startNode = new Node(startGrid.x, startGrid.y, 0, manhattanDistance(startGrid, endGrid), null);
+
+            openList.push(startNode);
+
+            while (openList.length > 0) {
+                // Find the node with the lowest F-score in the open list
+                openList.sort((a, b) => a.f - b.f);
+                const currentNode = openList.shift(); // Pop best node
+
+                const key = `${currentNode.x},${currentNode.y}`;
+                if (closedList.has(key)) continue;
+                closedList.add(key);
+
+                // Goal check
+                if (currentNode.x === endGrid.x && currentNode.y === endGrid.y) {
+                    return reconstructPath(currentNode);
+                }
+
+                // Generate neighbors (8 directions)
+                for (let dx = -1; dx <= 1; dx++) {
+                    for (let dy = -1; dy <= 1; dy++) {
+                        if (dx === 0 && dy === 0) continue;
+
+                        const neighborX = currentNode.x + dx;
+                        const neighborY = currentNode.y + dy;
+
+                        // Check bounds and wall/buffer condition
+                        if (!isWalkableWithBuffer(neighborX, neighborY)) {
+                            continue;
+                        }
+
+                        // Diagonal movement costs 1.414 (approx 14), straight costs 1 (approx 10)
+                        const moveCost = (dx !== 0 && dy !== 0) ? 14 : 10;
+                        const newG = currentNode.g + moveCost;
+
+                        const neighborNode = new Node(
+                            neighborX, neighborY,
+                            newG,
+                            manhattanDistance({ x: neighborX, y: neighborY }, endGrid),
+                            currentNode
+                        );
+
+                        // If already in closed list, skip
+                        const neighborKey = `${neighborX},${neighborY}`;
+                        if (closedList.has(neighborKey)) continue;
+
+                        // Check if a better path to this neighbor is already in the open list
+                        const existingNode = openList.find(n => n.x === neighborX && n.y === neighborY);
+                        if (existingNode && existingNode.g <= newG) {
+                            continue;
+                        }
+
+                        // Add new node or update existing one
+                        if (!existingNode) {
+                            openList.push(neighborNode);
+                        } else {
+                            existingNode.g = newG;
+                            existingNode.f = existingNode.g + existingNode.h;
+                            existingNode.parent = currentNode;
+                        }
+                    }
+                }
+            }
+
+            return null; // No path found
+        }
+
+        /** Checks if the enemy has a direct line of sight to the player, */
+        function checkLineOfSight(p1, p2) {
+            const step = 0.5; // smaller steps for checking
+            const dx = p2.x - p1.x;
+            const dy = p2.y - p1.y;
+            const distance = Math.sqrt(dx * dx + dy * dy);
+            const numSteps = Math.floor(distance / step);
+
+            for (let i = 1; i < numSteps; i++) {
+                const ratio = i / numSteps;
+                const checkX = p1.x + dx * ratio;
+                const checkY = p1.y + dy * ratio;
+
+                const gx = toGrid(checkX);
+                const gy = toGrid(checkY);
+
+                // Check for collision with walls (no buffer needed here, just walls)
+                if (isWall(gx, gy)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // --- Enemy Class ---
+
+        class Enemy {
+            constructor(x, y) {
+                this.x = x;
+                this.y = y;
+                this.radius = 8;
+                this.speed = 1.5;
+                this.health = 3; // 3 hits to kill
+                this.path = []; // Path generated by A*
+                this.target = null; // Current target point in the path
+                this.state = 'A*'; // 'A*' or 'Beeline'
+                this.damageCooldown = 0; // Cooldown timer for dealing damage to player
+            }
+
+            update(deltaTime, player) {
+                if (this.health <= 0) return;
+
+                // 1. Line of Sight Check
+                const hasLOS = checkLineOfSight(this, player);
+
+                if (hasLOS) {
+                    this.state = 'Beeline';
+                    this.path = []; // Clear A* path
+                } else {
+                    // Only revert to A* if we don't already have an active path
+                    if (this.state === 'Beeline') {
+                       // Switch back to A* on LOS loss, but wait for the interval before calculating a new path
+                       this.state = 'A*';
+                    }
+                }
+
+                // 2. Movement Logic
+                let targetX = 0, targetY = 0;
+                let dx, dy, angle;
+
+                if (this.state === 'Beeline') {
+                    // Beeline: Move directly towards the player
+                    targetX = player.x;
+                    targetY = player.y;
+                } else { // A* State
+                    // A* logic: Recalculate path periodically
+                    if (performance.now() - lastPathfindTime > pathfindingInterval || this.path.length === 0) {
+                        this.path = findPath(this, player) || [];
+                        lastPathfindTime = performance.now();
+                    }
+
+                    if (this.path.length > 0) {
+                        this.target = this.path[0];
+                        targetX = this.target.x;
+                        targetY = this.target.y;
+
+                        // Check if we reached the current target node
+                        if (distSq(this, this.target) < 100) { // Small distance threshold
+                            this.path.shift();
+                            this.target = this.path[0]; // Move to the next node
+                        }
+                    } else {
+                        // A* failed or destination reached
+                        return;
+                    }
+                }
+
+                // 3. Apply Movement
+                dx = targetX - this.x;
+                dy = targetY - this.y;
+                angle = Math.atan2(dy, dx);
+
+                this.x += Math.cos(angle) * this.speed * (deltaTime / 16.67); // Normalize speed
+                this.y += Math.sin(angle) * this.speed * (deltaTime / 16.67);
+
+                // 4. Attack (Damage Player) - Deals 1 damage per second
+                this.damageCooldown = Math.max(0, this.damageCooldown - deltaTime);
+                if (distSq(this, player) < (this.radius + player.radius) ** 2 && this.damageCooldown <= 0) {
+                    // Damage player (1 damage per second)
+                    player.health = Math.max(0, player.health - 1);
+                    this.damageCooldown = 1000; // 1 second cooldown
+                }
+            }
+
+            draw() {
+                if (this.health <= 0) return;
+
+                // --- Path Drawing Logic Removed Here ---
+
+                // Draw Enemy
+                ctx.fillStyle = COLOR_ENEMY;
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+                ctx.fill();
+
+                // Draw Health Bar
+                const hpWidth = (this.health / 3) * 16;
+                ctx.fillStyle = this.health === 1 ? '#ffaa00' : '#00ff00';
+                ctx.fillRect(this.x - 8, this.y - 15, hpWidth, 3);
+                ctx.strokeStyle = '#222';
+                ctx.strokeRect(this.x - 8, this.y - 15, 16, 3);
+            }
+        }
+
+        // --- Collision and Spawning Logic ---
+
+        /** Handles collision and separation between two circular entities (prevents overlap) */
+        function separateEntities(e1, e2) {
+            const dx = e2.x - e1.x;
+            const dy = e2.y - e1.y;
+            const distance = Math.sqrt(dx * dx + dy * dy);
+            const minDistance = e1.radius + e2.radius;
+
+            if (distance < minDistance) {
+                const overlap = minDistance - distance;
+                const angle = Math.atan2(dy, dx);
+                // Push both entities away from each other by half the overlap distance
+                const separationX = Math.cos(angle) * overlap * 0.5;
+                const separationY = Math.sin(angle) * overlap * 0.5;
+
+                e1.x -= separationX;
+                e1.y -= separationY;
+                e2.x += separationX;
+                e2.y += separationY;
+            }
+        }
+
+        function handleEntityCollisions() {
+            // Player vs Enemies
+            enemies.forEach(enemy => {
+                if (enemy.health > 0) {
+                    separateEntities(player, enemy);
+                }
+            });
+
+            // Enemy vs Enemy (important to prevent enemies from bunching up)
+            for (let i = 0; i < enemies.length; i++) {
+                for (let j = i + 1; j < enemies.length; j++) {
+                    if (enemies[i].health > 0 && enemies[j].health > 0) {
+                        separateEntities(enemies[i], enemies[j]);
+                    }
+                }
+            }
+        }
+
+        /** Finds a safe, walkable grid cell far from the player's starting position */
+        function findSafeSpawnPoint() {
+            const safetyRadius = 7; // Spawn at least 7 cells away from the player start (1.5, 1.5)
+            const playerStartGridX = toGrid(CELL_SIZE * 1.5);
+            const playerStartGridY = toGrid(CELL_SIZE * 1.5);
+
+            while (true) {
+                const gx = Math.floor(Math.random() * (GRID_SIZE - 2)) + 1;
+                const gy = Math.floor(Math.random() * (GRID_SIZE - 2)) + 1;
+
+                if (isWalkableWithBuffer(gx, gy)) {
+                    // Check distance from player start
+                    if (Math.abs(gx - playerStartGridX) > safetyRadius || Math.abs(gy - playerStartGridY) > safetyRadius) {
+                         return { x: toWorld(gx), y: toWorld(gy) };
+                    }
+                }
+            }
+        }
+
+        function spawnEnemy(timestamp) {
+            const liveEnemies = enemies.filter(e => e.health > 0).length;
+
+            if (liveEnemies < MAX_ENEMIES && timestamp - lastSpawnTime > SPAWN_INTERVAL) {
+                const spawnPoint = findSafeSpawnPoint();
+                enemies.push(new Enemy(spawnPoint.x, spawnPoint.y));
+                lastSpawnTime = timestamp;
+            }
+        }
+
+
+        // --- Game Initialization ---
+
+        function initEnemies() {
+            // Spawn initial enemies, spawner will handle the rest up to MAX_ENEMIES
+            enemies = [];
+            enemies.push(new Enemy(toWorld(27), toWorld(27)));
+            enemies.push(new Enemy(toWorld(1), toWorld(27)));
+            enemies.push(new Enemy(toWorld(27), toWorld(1)));
+            document.getElementById('enemy-count').textContent = enemies.length;
+        }
+
+        initEnemies();
+        
+        // NEW: Function to reset the game state
+        function respawnGame() {
+            if (!gameOver) return;
+
+            // Reset Player
+            player.x = CELL_SIZE * 1.5;
+            player.y = CELL_SIZE * 1.5;
+            player.health = player.maxHealth;
+            player.isAttacking = false;
+            player.lastDamageTime = 0;
+            
+            // Reset Game State
+            gameOver = false;
+            lastSpawnTime = 0;
+
+            // Re-initialize Enemies
+            initEnemies();
+            respawnButton.classList.add('hidden');
+        }
+
+        // --- Game Loop Functions ---
+
+        function update(deltaTime) {
+            if (gameOver) return;
+
+            // 1. Player Movement
+            player.vx = 0;
+            player.vy = 0;
+            if (keys['w']) player.vy -= 1;
+            if (keys['s']) player.vy += 1;
+            if (keys['a']) player.vx -= 1;
+            if (keys['d']) player.vx += 1;
+
+            // Normalize diagonal movement
+            const magnitude = Math.sqrt(player.vx * player.vx + player.vy * player.vy);
+            if (magnitude > 0) {
+                player.vx /= magnitude;
+                player.vy /= magnitude;
+            }
+
+            const moveX = player.vx * player.speed * (deltaTime / 16.67);
+            const moveY = player.vy * player.speed * (deltaTime / 16.67);
+
+            // Apply movement with wall collision check
+            const newX = player.x + moveX;
+            const newY = player.y + moveY;
+
+            // Simple cell-based collision: if the player center enters a wall cell, stop movement.
+            const playerGridX = toGrid(newX);
+            const playerGridY = toGrid(newY);
+
+            if (isWall(playerGridX, playerGridY)) {
+                const oldGridX = toGrid(player.x);
+                const oldGridY = toGrid(player.y);
+
+                if (isWall(toGrid(player.x + moveX), oldGridY)) {
+                    player.x = player.x; // Block X movement
+                } else {
+                    player.x += moveX;
+                }
+
+                if (isWall(oldGridX, toGrid(player.y + moveY))) {
+                    player.y = player.y; // Block Y movement
+                } else {
+                    player.y += moveY;
+                }
+            } else {
+                 player.x = newX;
+                 player.y = newY;
+            }
+
+
+            // 2. Enemy Update
+            enemies.forEach(enemy => enemy.update(deltaTime, player));
+
+            // 3. Handle Entity Overlap Collision
+            handleEntityCollisions();
+
+            // 4. Enemy Spawning
+            spawnEnemy(performance.now());
+
+            // 5. Attack Update
+            if (player.isAttacking && performance.now() > player.attackStartTime + player.attackDuration) {
+                player.isAttacking = false;
+            }
+
+            // Check for sword hit during attack
+            if (player.isAttacking && performance.now() > player.lastDamageTime + player.damageCooldown) {
+                const attackAngle = Math.atan2(mousePos.y - player.y, mousePos.x - player.x);
+                const attackRadius = player.radius + 30; // Length of the sword swing
+                const halfArc = Math.PI / 4; // Swing arc size (45 degrees total)
+
+                enemies.forEach(enemy => {
+                    if (enemy.health <= 0) return;
+
+                    const dx = enemy.x - player.x;
+                    const dy = enemy.y - player.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    const enemyAngle = Math.atan2(dy, dx);
+
+                    // Check distance
+                    if (dist < attackRadius) {
+                        // Check angle (if enemy is within the swing arc)
+                        let angleDiff = attackAngle - enemyAngle;
+                        // Normalize angle difference to be between -PI and PI
+                        if (angleDiff > Math.PI) angleDiff -= 2 * Math.PI;
+                        if (angleDiff < -Math.PI) angleDiff += 2 * Math.PI;
+
+                        if (Math.abs(angleDiff) < halfArc) {
+                            // Hit! Deal 1 damage
+                            enemy.health -= 1;
+                            player.lastDamageTime = performance.now(); // Reset damage cooldown
+                        }
+                    }
+                });
+            }
+
+            // 6. Clean up dead enemies and check for game over
+            enemies = enemies.filter(e => e.health > 0);
+            
+            if (player.health <= 0) {
+                gameOver = true;
+            }
+
+            // Update enemy count display
+            document.getElementById('enemy-count').textContent = enemies.length;
+        }
+
+        function draw() {
+            // 1. Draw Dungeon Floor
+            ctx.fillStyle = COLOR_FLOOR;
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // 2. Draw Walls
+            ctx.fillStyle = COLOR_WALL;
+            for (let y = 0; y < GRID_SIZE; y++) {
+                for (let x = 0; x < GRID_SIZE; x++) {
+                    if (dungeonMap[y][x] === 1) {
+                        ctx.fillRect(x * CELL_SIZE, y * CELL_SIZE, CELL_SIZE, CELL_SIZE);
+                    }
+                }
+            }
+
+            // 3. Draw Enemies
+            enemies.forEach(enemy => enemy.draw());
+
+            // 4. Draw Player
+            ctx.fillStyle = COLOR_PLAYER;
+            ctx.beginPath();
+            ctx.arc(player.x, player.y, player.radius, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Draw Player Health Bar
+            const playerHpWidth = (player.health / player.maxHealth) * 20;
+            ctx.fillStyle = player.health > 3 ? '#00ff00' : '#ffaa00';
+            ctx.fillRect(player.x - 10, player.y + player.radius + 5, playerHpWidth, 4);
+            ctx.strokeStyle = '#222';
+            ctx.strokeRect(player.x - 10, player.y + player.radius + 5, 20, 4);
+
+            // 5. Draw Sword Attack (if attacking)
+            if (player.isAttacking) {
+                const elapsed = performance.now() - player.attackStartTime;
+                const swingRatio = elapsed / player.attackDuration;
+                const attackAngle = Math.atan2(mousePos.y - player.y, mousePos.x - player.x);
+                const startAngle = attackAngle - Math.PI / 4;
+                const endAngle = attackAngle + Math.PI / 4;
+
+                // Adjust arc based on swing progress (can be used for animation)
+                const currentEndAngle = startAngle + (endAngle - startAngle) * swingRatio;
+
+                ctx.save();
+                ctx.globalAlpha = 1 - swingRatio; // Fade out the swing
+                ctx.strokeStyle = COLOR_SWORD;
+                ctx.lineWidth = 4;
+                ctx.beginPath();
+                ctx.arc(player.x, player.y, player.radius + 20, startAngle, currentEndAngle);
+                ctx.lineTo(player.x, player.y);
+                ctx.closePath();
+                ctx.stroke();
+                ctx.restore();
+            }
+
+            // 6. Draw Game Over screen
+            if (gameOver) {
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = '#fff';
+                ctx.font = '36px Inter';
+                ctx.textAlign = 'center';
+
+                if (player.health <= 0) {
+                    ctx.fillText('GAME OVER!', canvas.width / 2, canvas.height / 2);
+                    ctx.font = '20px Inter';
+                    ctx.fillText('You were defeated.', canvas.width / 2, canvas.height / 2 + 40);
+                    
+                    // Show Respawn Button only when player is defeated
+                    respawnButton.classList.remove('hidden');
+                    
+                } else {
+                    ctx.fillText('DUNGEON CLEARED!', canvas.width / 2, canvas.height / 2);
+                    respawnButton.classList.add('hidden'); 
+                }
+                
+            } else {
+                // Ensure button is hidden during gameplay
+                respawnButton.classList.add('hidden');
+            }
+        }
+
+        // --- Main Game Loop ---
+        function gameLoop(timestamp) {
+            const deltaTime = timestamp - lastTimestamp;
+            lastTimestamp = timestamp;
+
+            update(deltaTime);
+            draw();
+
+            requestAnimationFrame(gameLoop);
+        }
+
+        // --- Event Listeners ---
+
+        document.addEventListener('keydown', (e) => {
+            keys[e.key.toLowerCase()] = true;
+        });
+
+        document.addEventListener('keyup', (e) => {
+            keys[e.key.toLowerCase()] = false;
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            mousePos.x = e.clientX - rect.left;
+            mousePos.y = e.clientY - rect.top;
+        });
+
+        canvas.addEventListener('mousedown', (e) => {
+            // Only trigger on left mouse button click (button 0)
+            if (e.button === 0 && !gameOver) {
+                // Check player's weapon cooldown
+                if (performance.now() > player.attackStartTime + player.damageCooldown) { 
+                    player.isAttacking = true;
+                    player.attackStartTime = performance.now();
+                }
+            }
+        });
+
+        // Start the game loop
+        requestAnimationFrame(gameLoop);
+    </script>
+
+</body>
+</html>
